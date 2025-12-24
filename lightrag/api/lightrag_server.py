@@ -1,19 +1,20 @@
 """
 LightRAG FastAPI Server
 """
-
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks
 from fastapi.openapi.docs import (
     get_swagger_ui_html,
     get_swagger_ui_oauth2_redirect_html,
 )
 import os
-import logging
-import logging.config
 import sys
 import uvicorn
+import asyncio
+import logging
+import logging.config
 import pipmaster as pm
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
@@ -25,6 +26,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from lightrag.api.utils_api import (
     get_combined_auth_dependency,
+    get_require_workspace_dependency,
     display_splash_screen,
     check_env_file,
 )
@@ -63,6 +65,26 @@ from lightrag.kg.shared_storage import (
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
+from pydantic import BaseModel, Field
+
+# Import ClientManager for direct database access in auth endpoints
+try:
+    from lightrag.kg.postgres_impl import ClientManager
+    HAS_POSTGRES = True
+except ImportError:
+    HAS_POSTGRES = False
+    ClientManager = None
+
+class UserRegisterRequest(BaseModel):
+    username: str
+    password: str
+    email: str | None = None
+
+class WorkspaceCreateRequest(BaseModel):
+    name: str
+
+class WorkspaceSelectRequest(BaseModel):
+    workspace_name: str
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -367,6 +389,10 @@ def create_app(args):
         finally:
             # Clean up database connections
             await rag.finalize_storages()
+            
+            # Also finalize any workspace-specific RAG instances
+            if hasattr(app.state, 'workspace_rag_manager'):
+                await app.state.workspace_rag_manager.finalize_all()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -455,6 +481,97 @@ def create_app(args):
 
     # Create combined auth dependency for all endpoints
     combined_auth = get_combined_auth_dependency(api_key)
+    
+    # Create workspace requirement dependency for data endpoints
+    require_workspace = get_require_workspace_dependency()
+
+    # Workspace RAG Manager for per-user data isolation
+    class WorkspaceRAGManager:
+        """Manages per-workspace RAG instances with lazy loading"""
+        
+        def __init__(self, base_working_dir: str, args):
+            self._instances: dict[str, LightRAG] = {}
+            self._base_working_dir = base_working_dir
+            self._args = args
+            self._lock = asyncio.Lock()
+        
+        def get_workspace_dir(self, workspace: str) -> str:
+            """Get working directory for a specific workspace"""
+            if not workspace:
+                return self._base_working_dir
+            return os.path.join(self._base_working_dir, "workspaces", workspace)
+        
+        async def get_rag(self, workspace: str) -> LightRAG:
+            """Get or create RAG instance for the given workspace"""
+            if not workspace:
+                # No workspace = use default global instance
+                return None
+            
+            if workspace in self._instances:
+                return self._instances[workspace]
+            
+            async with self._lock:
+                # Double-check after acquiring lock
+                if workspace in self._instances:
+                    return self._instances[workspace]
+                
+                workspace_dir = self.get_workspace_dir(workspace)
+                os.makedirs(workspace_dir, exist_ok=True)
+                
+                logger.info(f"Creating RAG instance for workspace: {workspace} at {workspace_dir}")
+                
+                # Create new RAG instance for this workspace
+                rag_instance = LightRAG(
+                    working_dir=workspace_dir,
+                    workspace=workspace,
+                    llm_model_func=create_llm_model_func(self._args.llm_binding),
+                    llm_model_name=self._args.llm_model,
+                    llm_model_max_async=self._args.max_async,
+                    summary_max_tokens=self._args.summary_max_tokens,
+                    summary_context_size=self._args.summary_context_size,
+                    chunk_token_size=int(self._args.chunk_size),
+                    chunk_overlap_token_size=int(self._args.chunk_overlap_size),
+                    llm_model_kwargs=create_llm_model_kwargs(
+                        self._args.llm_binding, self._args, llm_timeout
+                    ),
+                    embedding_func=embedding_func,
+                    default_llm_timeout=llm_timeout,
+                    default_embedding_timeout=embedding_timeout,
+                    kv_storage=self._args.kv_storage,
+                    graph_storage=self._args.graph_storage,
+                    vector_storage=self._args.vector_storage,
+                    doc_status_storage=self._args.doc_status_storage,
+                    vector_db_storage_cls_kwargs={
+                        "cosine_better_than_threshold": self._args.cosine_threshold
+                    },
+                    enable_llm_cache_for_entity_extract=self._args.enable_llm_cache_for_extract,
+                    enable_llm_cache=self._args.enable_llm_cache,
+                    rerank_model_func=rerank_model_func if 'rerank_model_func' in dir() else None,
+                    max_parallel_insert=self._args.max_parallel_insert,
+                    max_graph_nodes=self._args.max_graph_nodes,
+                    addon_params={
+                        "language": self._args.summary_language,
+                        "entity_types": self._args.entity_types,
+                    },
+                )
+                
+                # Initialize storages
+                await rag_instance.initialize_storages()
+                
+                self._instances[workspace] = rag_instance
+                logger.info(f"RAG instance for workspace '{workspace}' initialized")
+                
+                return rag_instance
+        
+        async def finalize_all(self):
+            """Finalize all workspace RAG instances"""
+            for workspace, rag_instance in self._instances.items():
+                try:
+                    await rag_instance.finalize_storages()
+                    logger.info(f"Finalized RAG for workspace: {workspace}")
+                except Exception as e:
+                    logger.error(f"Error finalizing RAG for workspace {workspace}: {e}")
+            self._instances.clear()
 
     def get_workspace_from_request(request: Request) -> str | None:
         """
@@ -470,12 +587,14 @@ def create_app(args):
         Returns:
             Workspace identifier (may be empty string for global namespace)
         """
+        # Prioritize workspace from JWT token (set by combined_auth dependency)
+        if hasattr(request.state, "user") and request.state.user:
+            return request.state.user.get("metadata", {}).get("workspace")
+
         # Check custom header first
         workspace = request.headers.get("LIGHTRAG-WORKSPACE", "").strip()
-
         if not workspace:
             workspace = None
-
         return workspace
 
     # Create working directory if it doesn't exist
@@ -1081,12 +1200,27 @@ def create_app(args):
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
 
+    # Initialize WorkspaceRAGManager for per-user data isolation
+    workspace_rag_manager = WorkspaceRAGManager(args.working_dir, args)
+    # Store in app.state for lifespan cleanup and API access
+    app.state.workspace_rag_manager = workspace_rag_manager
+    
+    # Helper function to get RAG for a workspace (with fallback to default)
+    async def get_rag_for_workspace(workspace: str | None) -> LightRAG:
+        """Get RAG instance for workspace, falling back to default if no workspace"""
+        if workspace:
+            workspace_rag = await workspace_rag_manager.get_rag(workspace)
+            if workspace_rag:
+                return workspace_rag
+        return rag  # Fallback to default RAG
+
     # Add routes
     app.include_router(
         create_document_routes(
             rag,
             doc_manager,
             api_key,
+            get_rag_for_workspace_func=get_rag_for_workspace,
         )
     )
     app.include_router(create_query_routes(rag, api_key, args.top_k))
@@ -1125,68 +1259,410 @@ def create_app(args):
 
     @app.get("/auth-status")
     async def get_auth_status():
-        """Get authentication status and guest token if auth is not configured"""
-
-        if not auth_handler.accounts:
-            # Authentication not configured, return guest token
-            guest_token = auth_handler.create_token(
-                username="guest", role="guest", metadata={"auth_mode": "disabled"}
-            )
-            return {
-                "auth_configured": False,
-                "access_token": guest_token,
-                "token_type": "bearer",
-                "auth_mode": "disabled",
-                "message": "Authentication is disabled. Using guest access.",
-                "core_version": core_version,
-                "api_version": api_version_display,
-                "webui_title": webui_title,
-                "webui_description": webui_description,
-            }
-
+        """Get authentication status"""
+        auth_configured = bool(auth_handler.accounts) or HAS_POSTGRES
         return {
-            "auth_configured": True,
-            "auth_mode": "enabled",
-            "core_version": core_version,
-            "api_version": api_version_display,
+            "auth_configured": auth_configured,
+            "oauth_providers": list(auth_handler.oauth_configs.keys()) if hasattr(auth_handler, 'oauth_configs') else [],
             "webui_title": webui_title,
             "webui_description": webui_description,
         }
+
+    @app.post("/register")
+    async def register(request: UserRegisterRequest):
+        if not HAS_POSTGRES or ClientManager is None:
+             raise HTTPException(500, "Database not available")
+        
+        db = await ClientManager.get_client()
+        try:
+            existing = await db.query("SELECT 1 FROM LIGHTRAG_USERS WHERE username = $1", [request.username])
+            if existing:
+                raise HTTPException(400, "Username already exists")
+
+            pwd_hash = auth_handler.get_password_hash(request.password)
+            await db.execute(
+                "INSERT INTO LIGHTRAG_USERS (username, password_hash, email, auth_provider) VALUES ($1, $2, $3, 'local')",
+                {'1': request.username, '2': pwd_hash, '3': request.email}
+            )
+            
+            # Auto-create personal workspace with same name as username
+            await db.execute(
+                "INSERT INTO LIGHTRAG_USER_WORKSPACES (username, workspace_name, role) VALUES ($1, $2, 'owner')",
+                {'1': request.username, '2': request.username}
+            )
+            
+            return {"message": "User registered successfully", "workspace": request.username}
+        finally:
+            await ClientManager.release_client(db)
 
     @app.post("/login")
     async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-        if not auth_handler.accounts:
-            # Authentication not configured, return guest token
-            guest_token = auth_handler.create_token(
-                username="guest", role="guest", metadata={"auth_mode": "disabled"}
-            )
-            return {
-                "access_token": guest_token,
-                "token_type": "bearer",
-                "auth_mode": "disabled",
-                "message": "Authentication is disabled. Using guest access.",
-                "core_version": core_version,
-                "api_version": api_version_display,
-                "webui_title": webui_title,
-                "webui_description": webui_description,
-            }
-        username = form_data.username
-        if auth_handler.accounts.get(username) != form_data.password:
-            raise HTTPException(status_code=401, detail="Incorrect credentials")
+        # 1. Try DB Login
+        if HAS_POSTGRES and ClientManager is not None:
+            db = await ClientManager.get_client()
+            try:
+                user = await db.query("SELECT * FROM LIGHTRAG_USERS WHERE username = $1", [form_data.username])
+                if user:
+                    if not auth_handler.verify_password(form_data.password, user.get("password_hash")):
+                         raise HTTPException(401, "Incorrect credentials")
+                    
+                    # Fetch workspaces (use multirows=True for list)
+                    workspaces_rows = await db.query(
+                        "SELECT workspace_name, role FROM LIGHTRAG_USER_WORKSPACES WHERE username = $1",
+                        [form_data.username],
+                        multirows=True
+                    )
+                    workspaces = [{"name": r["workspace_name"], "role": r["role"]} for r in (workspaces_rows or [])]
+                    
+                    # Auto-select the first workspace (which is the user's personal workspace)
+                    selected_workspace = workspaces[0]["name"] if workspaces else form_data.username
+                    
+                    # Create token with workspace already selected
+                    token = auth_handler.create_token(
+                        username=form_data.username,
+                        role=user.get("role", "user"),
+                        metadata={"workspace": selected_workspace, "auth_provider": "local"}
+                    )
+                    return {
+                        "access_token": token,
+                        "token_type": "bearer",
+                        "workspace": selected_workspace,
+                        "workspaces": workspaces
+                    }
+            finally:
+                await ClientManager.release_client(db)
 
-        # Regular user login
-        user_token = auth_handler.create_token(
-            username=username, role="user", metadata={"auth_mode": "enabled"}
-        )
+        # 2. Fallback to .env accounts
+        if auth_handler.accounts and auth_handler.accounts.get(form_data.username) == form_data.password:
+             token = auth_handler.create_token(
+                 username=form_data.username, 
+                 role="user", 
+                 metadata={"workspace": "default"} 
+             )
+             return {"access_token": token, "token_type": "bearer", "workspaces": [{"name": "default", "role": "admin"}]}
+
+        # 3. Guest fallback
+        if not auth_handler.accounts and not HAS_POSTGRES:
+             guest_token = auth_handler.create_token("guest", "guest", metadata={"auth_mode": "disabled", "workspace": "default"})
+             return {"access_token": guest_token, "token_type": "bearer"}
+
+        raise HTTPException(401, "Incorrect credentials")
+
+    @app.get("/workspaces")
+    async def list_workspaces(request: Request, _=Depends(combined_auth)):
+        user_info = request.state.user
+        if not user_info:
+             raise HTTPException(401, "Not authenticated")
+        
+        if not HAS_POSTGRES or ClientManager is None:
+             return []
+
+        db = await ClientManager.get_client()
+        try:
+            rows = await db.query(
+                "SELECT workspace_name, role FROM LIGHTRAG_USER_WORKSPACES WHERE username = $1",
+                [user_info["username"]],
+                multirows=True
+            )
+            return [{"name": r["workspace_name"], "role": r["role"]} for r in (rows or [])]
+        finally:
+            await ClientManager.release_client(db)
+
+    @app.post("/workspaces")
+    async def create_workspace(body: WorkspaceCreateRequest, request: Request, _=Depends(combined_auth)):
+        user = request.state.user
+        if not user: raise HTTPException(401)
+        if not HAS_POSTGRES or ClientManager is None: raise HTTPException(500, "DB required")
+
+        db = await ClientManager.get_client()
+        try:
+            # Global uniqueness check
+            existing = await db.query("SELECT 1 FROM LIGHTRAG_USER_WORKSPACES WHERE workspace_name = $1", [body.name])
+            if existing:
+                raise HTTPException(400, "Workspace name already taken")
+
+            await db.execute(
+                "INSERT INTO LIGHTRAG_USER_WORKSPACES (username, workspace_name, role) VALUES ($1, $2, 'owner')",
+                {'1': user["username"], '2': body.name}
+            )
+            return {"message": "Workspace created", "workspace_name": body.name}
+        finally:
+            await ClientManager.release_client(db)
+
+    @app.post("/auth/select-workspace")
+    async def select_workspace(body: WorkspaceSelectRequest, request: Request, _=Depends(combined_auth)):
+        user = request.state.user
+        if not user: raise HTTPException(401)
+        if not HAS_POSTGRES or ClientManager is None: raise HTTPException(500, "DB required")
+        
+        db = await ClientManager.get_client()
+        try:
+            # Verify access
+            row = await db.query(
+                "SELECT role FROM LIGHTRAG_USER_WORKSPACES WHERE username = $1 AND workspace_name = $2",
+                [user["username"], body.workspace_name]
+            )
+            if not row:
+                raise HTTPException(403, "Access denied to workspace")
+
+            new_token = auth_handler.create_token(
+                username=user["username"],
+                role=user.get("role", "user"),
+                metadata={
+                    "workspace": body.workspace_name, 
+                    "auth_provider": user.get("metadata", {}).get("auth_provider"),
+                    "workspace_role": row["role"]
+                }
+            )
+            return {"access_token": new_token, "token_type": "bearer"}
+        finally:
+            await ClientManager.release_client(db)
+
+    @app.get("/workspace/info", dependencies=[Depends(combined_auth), Depends(require_workspace)])
+    async def get_workspace_info(request: Request):
+        """Get information about the current workspace and its RAG instance"""
+        workspace = request.state.workspace
+        workspace_rag = await get_rag_for_workspace(workspace)
+        
+        workspace_dir = workspace_rag_manager.get_workspace_dir(workspace)
+        
+        # Get graph stats if available
+        graph_stats = {"nodes": 0, "edges": 0}
+        if workspace_rag and hasattr(workspace_rag, 'chunk_entity_relation_graph'):
+            try:
+                graph = workspace_rag.chunk_entity_relation_graph
+                if hasattr(graph, '_graph'):
+                    graph_stats = {
+                        "nodes": graph._graph.number_of_nodes() if hasattr(graph._graph, 'number_of_nodes') else 0,
+                        "edges": graph._graph.number_of_edges() if hasattr(graph._graph, 'number_of_edges') else 0,
+                    }
+            except Exception:
+                pass
+        
         return {
-            "access_token": user_token,
-            "token_type": "bearer",
-            "auth_mode": "enabled",
-            "core_version": core_version,
-            "api_version": api_version_display,
-            "webui_title": webui_title,
-            "webui_description": webui_description,
+            "workspace": workspace,
+            "working_dir": workspace_dir,
+            "rag_initialized": workspace in workspace_rag_manager._instances,
+            "graph_stats": graph_stats,
         }
+
+    # Workspace-aware query endpoint for data isolation
+    from pydantic import BaseModel as PydanticBaseModel, Field as PydanticField
+    from typing import Optional as OptionalType, List as ListType, Dict as DictType, Any as AnyType, Literal as LiteralType
+    
+    class WorkspaceQueryRequest(PydanticBaseModel):
+        query: str = PydanticField(min_length=3, description="Query text")
+        mode: LiteralType["local", "global", "hybrid", "naive", "mix", "bypass"] = PydanticField(default="mix")
+        top_k: OptionalType[int] = PydanticField(default=None, ge=1)
+        
+    @app.post("/workspace/query", dependencies=[Depends(combined_auth), Depends(require_workspace)])
+    async def workspace_query(request_body: WorkspaceQueryRequest, request: Request):
+        """Query using workspace-specific RAG instance (isolated data)"""
+        from lightrag.base import QueryParam
+        
+        workspace = request.state.workspace
+        workspace_rag = await get_rag_for_workspace(workspace)
+        
+        param = QueryParam(mode=request_body.mode, stream=False)
+        if request_body.top_k:
+            param.top_k = request_body.top_k
+        
+        try:
+            result = await workspace_rag.aquery_llm(request_body.query, param=param)
+            llm_response = result.get("llm_response", {})
+            response_content = llm_response.get("content", "No relevant context found.")
+            
+            return {
+                "workspace": workspace,
+                "response": response_content,
+                "mode": request_body.mode,
+            }
+        except Exception as e:
+            logger.error(f"Workspace query error: {e}")
+            raise HTTPException(500, str(e))
+
+    class WorkspaceInsertTextRequest(PydanticBaseModel):
+        text: str = PydanticField(min_length=1, description="Text content to insert")
+        file_source: OptionalType[str] = PydanticField(default=None, description="Optional file source name")
+        
+    @app.post("/workspace/insert", dependencies=[Depends(combined_auth), Depends(require_workspace)])
+    async def workspace_insert_text(request_body: WorkspaceInsertTextRequest, request: Request, background_tasks: BackgroundTasks):
+        """Insert text into workspace-specific RAG (isolated data)"""
+        workspace = request.state.workspace
+        workspace_rag = await get_rag_for_workspace(workspace)
+        
+        async def insert_task():
+            try:
+                await workspace_rag.ainsert(request_body.text, file_paths=[request_body.file_source] if request_body.file_source else None)
+            except Exception as e:
+                logger.error(f"Workspace insert error: {e}")
+        
+        background_tasks.add_task(insert_task)
+        
+        return {
+            "status": "success",
+            "message": f"Text queued for insertion into workspace '{workspace}'",
+            "workspace": workspace,
+        }
+
+    from fastapi import UploadFile, File as FastAPIFile
+    
+    @app.post("/workspace/documents/upload", dependencies=[Depends(combined_auth), Depends(require_workspace)])
+    async def workspace_upload_document(
+        request: Request,
+        file: UploadFile = FastAPIFile(...),
+        background_tasks: BackgroundTasks = None
+    ):
+        """Upload document to workspace-specific RAG (isolated data)"""
+        workspace = request.state.workspace
+        workspace_rag = await get_rag_for_workspace(workspace)
+        
+        if not file.filename:
+            raise HTTPException(400, "No file provided")
+        
+        try:
+            # Read file content
+            content = await file.read()
+            
+            # Detect file type and extract text
+            file_ext = os.path.splitext(file.filename)[1].lower()
+            
+            if file_ext == '.txt':
+                text_content = content.decode('utf-8')
+            elif file_ext == '.pdf':
+                # Import PDF reader
+                try:
+                    import fitz  # PyMuPDF
+                    pdf_doc = fitz.open(stream=content, filetype="pdf")
+                    text_content = ""
+                    for page in pdf_doc:
+                        text_content += page.get_text()
+                    pdf_doc.close()
+                except ImportError:
+                    raise HTTPException(500, "PDF support requires PyMuPDF (fitz)")
+            else:
+                # Try to decode as text
+                try:
+                    text_content = content.decode('utf-8')
+                except UnicodeDecodeError:
+                    raise HTTPException(400, f"Unsupported file type: {file_ext}")
+            
+            if not text_content.strip():
+                raise HTTPException(400, "File is empty or could not be read")
+            
+            # Insert into workspace RAG
+            async def insert_task():
+                try:
+                    await workspace_rag.ainsert(text_content, file_paths=[file.filename])
+                    logger.info(f"[{workspace}] Document '{file.filename}' inserted successfully")
+                except Exception as e:
+                    logger.error(f"[{workspace}] Failed to insert document '{file.filename}': {e}")
+            
+            background_tasks.add_task(insert_task)
+            
+            return {
+                "status": "success",
+                "message": f"Document '{file.filename}' queued for processing in workspace '{workspace}'",
+                "workspace": workspace,
+                "filename": file.filename,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Workspace upload error: {e}")
+            raise HTTPException(500, str(e))
+
+    @app.get("/workspace/graph", dependencies=[Depends(combined_auth), Depends(require_workspace)])
+    async def workspace_graph(request: Request, label: str = "", max_depth: int = 3, max_nodes: int = 500):
+        """Get knowledge graph from workspace-specific RAG (isolated data)"""
+        workspace = request.state.workspace
+        workspace_rag = await get_rag_for_workspace(workspace)
+        
+        try:
+            graph = workspace_rag.chunk_entity_relation_graph
+            if hasattr(graph, 'get_knowledge_graph'):
+                kg_result = await graph.get_knowledge_graph(
+                    node_label=label,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes
+                )
+                # KnowledgeGraph object has .nodes and .edges attributes
+                nodes = []
+                for node in kg_result.nodes:
+                    nodes.append({
+                        "id": node.id,
+                        "labels": node.labels,
+                        "properties": node.properties
+                    })
+                edges = []
+                for edge in kg_result.edges:
+                    edges.append({
+                        "id": edge.id,
+                        "type": edge.type,
+                        "source": edge.source,
+                        "target": edge.target,
+                        "properties": edge.properties
+                    })
+                return {
+                    "workspace": workspace,
+                    "nodes": nodes,
+                    "edges": edges,
+                }
+            else:
+                return {"workspace": workspace, "nodes": [], "edges": [], "message": "Graph not available"}
+        except Exception as e:
+            logger.error(f"Workspace graph error: {e}")
+            raise HTTPException(500, str(e))
+
+    @app.get("/auth/{provider}/login")
+    async def oauth_login(provider: str, request: Request):
+        # Construct callback URL based on current host
+        scheme = request.url.scheme
+        host = request.url.netloc # includes port
+        callback_url = f"{scheme}://{host}/auth/{provider}/callback"
+        
+        login_url = await auth_handler.get_oauth_login_url(provider, callback_url)
+        return {"login_url": login_url}
+
+    @app.get("/auth/{provider}/callback")
+    async def oauth_callback(provider: str, code: str, request: Request):
+        scheme = request.url.scheme
+        host = request.url.netloc
+        callback_url = f"{scheme}://{host}/auth/{provider}/callback"
+
+        user_info = await auth_handler.get_oauth_user_info(provider, code, callback_url)
+        username = user_info["username"]
+        workspaces = []
+        
+        # Check/Create user in DB
+        if HAS_POSTGRES and ClientManager is not None:
+            db = await ClientManager.get_client()
+            try:
+                existing = await db.query("SELECT 1 FROM LIGHTRAG_USERS WHERE username = $1", [username])
+                if not existing:
+                    await db.execute(
+                        "INSERT INTO LIGHTRAG_USERS (username, email, auth_provider) VALUES ($1, $2, $3)",
+                        {'1': username, '2': user_info["email"], '3': provider}
+                    )
+                
+                # Fetch workspaces
+                rows = await db.query(
+                    "SELECT workspace_name, role FROM LIGHTRAG_USER_WORKSPACES WHERE username = $1",
+                    [username],
+                    multirows=True
+                )
+                workspaces = [{"name": r["workspace_name"], "role": r["role"]} for r in (rows or [])]
+            finally:
+                await ClientManager.release_client(db)
+
+        token = auth_handler.create_token(
+            username=username,
+            role="user",
+            metadata={"workspace": None, "auth_provider": provider}
+        )
+        
+        target_url = f"/webui?token={token}&workspace_count={len(workspaces)}"
+        return RedirectResponse(target_url)
 
     @app.get(
         "/health",

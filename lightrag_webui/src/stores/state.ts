@@ -31,6 +31,7 @@ interface AuthState {
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
+  workspace: string | null; // current workspace from JWT
   webuiTitle: string | null; // Custom title
   webuiDescription: string | null; // Title description
 
@@ -156,7 +157,7 @@ const useBackendState = createSelectors(useBackendStateStoreBase)
 
 export { useBackendState }
 
-const parseTokenPayload = (token: string): { sub?: string; role?: string } => {
+const parseTokenPayload = (token: string): { sub?: string; role?: string; metadata?: { workspace?: string } } => {
   try {
     // JWT tokens are in the format: header.payload.signature
     const parts = token.split('.');
@@ -179,13 +180,19 @@ const isGuestToken = (token: string): boolean => {
   return payload.role === 'guest';
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
+const getWorkspaceFromToken = (token: string): string | null => {
+  const payload = parseTokenPayload(token);
+  return payload.metadata?.workspace || null;
+};
+
+const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; workspace: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
   const webuiTitle = localStorage.getItem('LIGHTRAG-WEBUI-TITLE');
   const webuiDescription = localStorage.getItem('LIGHTRAG-WEBUI-DESCRIPTION');
   const username = token ? getUsernameFromToken(token) : null;
+  const workspace = token ? getWorkspaceFromToken(token) : null;
 
   if (!token) {
     return {
@@ -194,6 +201,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
       coreVersion: coreVersion,
       apiVersion: apiVersion,
       username: null,
+      workspace: null,
       webuiTitle: webuiTitle,
       webuiDescription: webuiDescription,
     };
@@ -205,6 +213,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
     coreVersion: coreVersion,
     apiVersion: apiVersion,
     username: username,
+    workspace: workspace,
     webuiTitle: webuiTitle,
     webuiDescription: webuiDescription,
   };
@@ -220,6 +229,7 @@ export const useAuthStore = create<AuthState>(set => {
     coreVersion: initialState.coreVersion,
     apiVersion: initialState.apiVersion,
     username: initialState.username,
+    workspace: initialState.workspace,
     webuiTitle: initialState.webuiTitle,
     webuiDescription: initialState.webuiDescription,
 
@@ -246,10 +256,12 @@ export const useAuthStore = create<AuthState>(set => {
       }
 
       const username = getUsernameFromToken(token);
+      const workspace = getWorkspaceFromToken(token);
       set({
         isAuthenticated: true,
         isGuestMode: isGuest,
         username: username,
+        workspace: workspace,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
         webuiTitle: webuiTitle,
@@ -269,6 +281,7 @@ export const useAuthStore = create<AuthState>(set => {
         isAuthenticated: false,
         isGuestMode: false,
         username: null,
+        workspace: null,
         coreVersion: coreVersion,
         apiVersion: apiVersion,
         webuiTitle: webuiTitle,

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
-import { loginToServer, getAuthStatus } from '@/api/lightrag'
+import { loginToServer, getAuthStatus, registerUser } from '@/api/lightrag'
 import { toast } from 'sonner'
 import { useTranslation } from 'react-i18next'
 import { Card, CardContent, CardHeader } from '@/components/ui/Card'
@@ -18,6 +18,8 @@ const LoginPage = () => {
   const [loading, setLoading] = useState(false)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [email, setEmail] = useState('')
+  const [isRegisterMode, setIsRegisterMode] = useState(false)
   const [checkingAuth, setCheckingAuth] = useState(true)
   const authCheckRef = useRef(false); // Prevent duplicate calls in Vite dev mode
 
@@ -86,6 +88,31 @@ const LoginPage = () => {
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
+
+    if (isRegisterMode) {
+      // Registration mode
+      if (!username || !password || !email) {
+        toast.error('Please fill in all fields')
+        return
+      }
+
+      try {
+        setLoading(true)
+        const response = await registerUser(username, password, email)
+        toast.success(response.message || 'Registration successful! Please login.')
+        // Switch to login mode after successful registration
+        setIsRegisterMode(false)
+      } catch (error: any) {
+        console.error('Registration failed...', error)
+        const errorMessage = error.response?.data?.detail || 'Registration failed'
+        toast.error(errorMessage)
+      } finally {
+        setLoading(false)
+      }
+      return
+    }
+
+    // Login mode
     if (!username || !password) {
       toast.error(t('login.errorEmptyFields'))
       return
@@ -159,7 +186,7 @@ const LoginPage = () => {
             <div className="text-center space-y-2">
               <h1 className="text-3xl font-bold tracking-tight">LightRAG</h1>
               <p className="text-muted-foreground text-sm">
-                {t('login.description')}
+                {isRegisterMode ? 'Create a new account' : t('login.description')}
               </p>
             </div>
           </div>
@@ -179,6 +206,22 @@ const LoginPage = () => {
                 className="h-11 flex-1"
               />
             </div>
+            {isRegisterMode && (
+              <div className="flex items-center gap-4">
+                <label htmlFor="email-input" className="text-sm font-medium w-16 shrink-0">
+                  Email
+                </label>
+                <Input
+                  id="email-input"
+                  type="email"
+                  placeholder="Enter your email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  required
+                  className="h-11 flex-1"
+                />
+              </div>
+            )}
             <div className="flex items-center gap-4">
               <label htmlFor="password-input" className="text-sm font-medium w-16 shrink-0">
                 {t('login.password')}
@@ -198,8 +241,36 @@ const LoginPage = () => {
               className="w-full h-11 text-base font-medium mt-2"
               disabled={loading}
             >
-              {loading ? t('login.loggingIn') : t('login.loginButton')}
+              {loading
+                ? (isRegisterMode ? 'Registering...' : t('login.loggingIn'))
+                : (isRegisterMode ? 'Register' : t('login.loginButton'))
+              }
             </Button>
+            <div className="text-center text-sm text-muted-foreground">
+              {isRegisterMode ? (
+                <>
+                  Already have an account?{' '}
+                  <button
+                    type="button"
+                    onClick={() => setIsRegisterMode(false)}
+                    className="text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300 font-medium"
+                  >
+                    Login here
+                  </button>
+                </>
+              ) : (
+                <>
+                  Don't have an account?{' '}
+                  <button
+                    type="button"
+                    onClick={() => setIsRegisterMode(true)}
+                    className="text-emerald-600 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300 font-medium"
+                  >
+                    Register here
+                  </button>
+                </>
+              )}
+            </div>
           </form>
         </CardContent>
       </Card>
@@ -208,3 +279,4 @@ const LoginPage = () => {
 }
 
 export default LoginPage
+

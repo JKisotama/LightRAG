@@ -1146,6 +1146,10 @@ class PostgreSQLDB:
                         )
 
                 # Create composite index for (workspace, id) if missing
+                # Skip for user management tables that don't follow the standard schema
+                if k in ["LIGHTRAG_USERS", "LIGHTRAG_USER_WORKSPACES"]:
+                    continue
+
                 composite_index_name = f"idx_{k.lower()}_workspace_id"
                 if composite_index_name not in existing_indexes:
                     try:
@@ -4904,6 +4908,25 @@ TABLES = {
                     create_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     update_time TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP,
                     CONSTRAINT LIGHTRAG_RELATION_CHUNKS_PK PRIMARY KEY (workspace, id)
+                    )"""
+    },
+    "LIGHTRAG_USERS": {
+        "ddl": """CREATE TABLE LIGHTRAG_USERS (
+                    username VARCHAR(255) PRIMARY KEY,
+                    password_hash VARCHAR(255) NULL,
+                    email VARCHAR(255),
+                    role VARCHAR(50) DEFAULT 'user',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    auth_provider VARCHAR(50) DEFAULT 'local'
+                    )"""
+    },
+    "LIGHTRAG_USER_WORKSPACES": {
+        "ddl": """CREATE TABLE LIGHTRAG_USER_WORKSPACES (
+                    username VARCHAR(255),
+                    workspace_name VARCHAR(255),
+                    role VARCHAR(50) DEFAULT 'owner',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (username, workspace_name)
                     )"""
     },
 }

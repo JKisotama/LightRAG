@@ -332,6 +332,25 @@ export const queryGraphs = async (
   maxDepth: number,
   maxNodes: number
 ): Promise<LightragGraphType> => {
+  // Check if user has workspace - use workspace-specific endpoint for data isolation
+  const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+  if (token) {
+    try {
+      const parts = token.split('.');
+      if (parts.length === 3) {
+        const payload = JSON.parse(atob(parts[1]));
+        const workspace = payload.metadata?.workspace;
+        if (workspace) {
+          // Use workspace-specific graph endpoint for isolated data
+          const response = await axiosInstance.get(`/workspace/graph?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`);
+          return response.data;
+        }
+      }
+    } catch (e) {
+      console.error('Error parsing token for workspace:', e);
+    }
+  }
+  // Fallback to default graph endpoint
   const response = await axiosInstance.get(`/graphs?label=${encodeURIComponent(label)}&max_depth=${maxDepth}&max_nodes=${maxNodes}`)
   return response.data
 }
@@ -516,27 +535,27 @@ export const queryTextStream = async (
       let userMessage = message;
 
       switch (statusCode) {
-      case 403:
-        userMessage = 'You do not have permission to access this resource (403 Forbidden)';
-        console.error('Permission denied for stream request:', message);
-        break;
-      case 404:
-        userMessage = 'The requested resource does not exist (404 Not Found)';
-        console.error('Resource not found for stream request:', message);
-        break;
-      case 429:
-        userMessage = 'Too many requests, please try again later (429 Too Many Requests)';
-        console.error('Rate limited for stream request:', message);
-        break;
-      case 500:
-      case 502:
-      case 503:
-      case 504:
-        userMessage = `Server error, please try again later (${statusCode})`;
-        console.error('Server error for stream request:', message);
-        break;
-      default:
-        console.error('Stream request failed with status code:', statusCode, message);
+        case 403:
+          userMessage = 'You do not have permission to access this resource (403 Forbidden)';
+          console.error('Permission denied for stream request:', message);
+          break;
+        case 404:
+          userMessage = 'The requested resource does not exist (404 Not Found)';
+          console.error('Resource not found for stream request:', message);
+          break;
+        case 429:
+          userMessage = 'Too many requests, please try again later (429 Too Many Requests)';
+          console.error('Rate limited for stream request:', message);
+          break;
+        case 500:
+        case 502:
+        case 503:
+        case 504:
+          userMessage = `Server error, please try again later (${statusCode})`;
+          console.error('Server error for stream request:', message);
+          break;
+        default:
+          console.error('Stream request failed with status code:', statusCode, message);
       }
 
       if (onError) {
@@ -547,8 +566,8 @@ export const queryTextStream = async (
 
     // Handle network errors (like connection refused, timeout, etc.)
     if (message.includes('NetworkError') ||
-        message.includes('Failed to fetch') ||
-        message.includes('Network request failed')) {
+      message.includes('Failed to fetch') ||
+      message.includes('Network request failed')) {
       console.error('Network error for stream request:', message);
       if (onError) {
         onError('Network connection error, please check your internet connection');
@@ -667,9 +686,9 @@ export const getAuthStatus = async (): Promise<AuthStatusResponse> => {
 
     // Strict validation of the response data
     if (response.data &&
-        typeof response.data === 'object' &&
-        'auth_configured' in response.data &&
-        typeof response.data.auth_configured === 'boolean') {
+      typeof response.data === 'object' &&
+      'auth_configured' in response.data &&
+      typeof response.data.auth_configured === 'boolean') {
 
       // For unconfigured auth, ensure we have an access token
       if (!response.data.auth_configured) {
@@ -724,6 +743,21 @@ export const loginToServer = async (username: string, password: string): Promise
     headers: {
       'Content-Type': 'multipart/form-data'
     }
+  });
+
+  return response.data;
+}
+
+export type RegisterResponse = {
+  message: string;
+  workspace: string;
+}
+
+export const registerUser = async (username: string, password: string, email: string): Promise<RegisterResponse> => {
+  const response = await axiosInstance.post('/register', {
+    username,
+    password,
+    email
   });
 
   return response.data;

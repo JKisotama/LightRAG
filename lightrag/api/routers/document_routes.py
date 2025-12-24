@@ -18,6 +18,7 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
+    Request,
     UploadFile,
 )
 from pydantic import BaseModel, Field, field_validator
@@ -2035,7 +2036,8 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None,
+    get_rag_for_workspace_func=None
 ):
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
@@ -2069,7 +2071,7 @@ def create_document_routes(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        background_tasks: BackgroundTasks, request: Request, file: UploadFile = File(...)
     ):
         """
         Upload a file to the input directory and index it.
@@ -2126,8 +2128,28 @@ def create_document_routes(
 
             track_id = generate_track_id("upload")
 
+            # Check if user has workspace and use workspace-specific RAG
+            target_rag = rag
+            # Debug log
+            if hasattr(request.state, 'user'):
+                logger.info(f"DEBUG: request.state.user = {request.state.user}")
+            else:
+                logger.info("DEBUG: request.state.user NOT SET")
+            
+            if get_rag_for_workspace_func and hasattr(request.state, 'user'):
+                user_info = request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    try:
+                        workspace_rag = await get_rag_for_workspace_func(workspace)
+                        if workspace_rag:
+                            target_rag = workspace_rag
+                            logger.info(f"Using workspace RAG for user: {workspace}")
+                    except Exception as e:
+                        logger.error(f"Failed to get workspace RAG: {e}, using default")
+
             # Add to background tasks and get track_id
-            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id)
+            background_tasks.add_task(pipeline_index_file, target_rag, file_path, track_id)
 
             return InsertResponse(
                 status="success",

@@ -53,7 +53,13 @@ for path in whitelist_paths:
             whitelist_patterns.append((path, False))  # (exact_path, is_prefix_match)
 
 # Global authentication configuration
-auth_configured = bool(auth_handler.accounts)
+# Auth is configured if either .env accounts exist OR PostgreSQL is enabled for user storage
+try:
+    from lightrag.kg.postgres_impl import ClientManager
+    HAS_POSTGRES = ClientManager is not None
+except ImportError:
+    HAS_POSTGRES = False
+auth_configured = bool(auth_handler.accounts) or HAS_POSTGRES
 
 
 def get_combined_auth_dependency(api_key: Optional[str] = None):
@@ -109,7 +115,13 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
                     return
                 # Accept non-guest token if auth is configured
                 if auth_configured and token_info.get("role") != "guest":
+                    request.state.user = token_info
                     return
+                
+                # Also set user for guest for consistency?
+                if not auth_configured and token_info.get("role") == "guest":
+                     request.state.user = token_info
+                     return
 
                 # Token validation failed, immediately return 401 error
                 raise HTTPException(
@@ -164,6 +176,37 @@ def get_combined_auth_dependency(api_key: Optional[str] = None):
         )
 
     return combined_dependency
+
+
+def get_require_workspace_dependency():
+    """
+    Create a dependency that requires a workspace to be selected.
+    Use this for endpoints that access user-specific data.
+    
+    Must be used AFTER combined_auth dependency.
+    """
+    async def require_workspace(request: Request):
+        # Check if user is authenticated
+        if not hasattr(request.state, "user") or not request.state.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+            )
+        
+        user = request.state.user
+        workspace = user.get("metadata", {}).get("workspace")
+        
+        if not workspace:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No workspace selected. Please select a workspace first.",
+            )
+        
+        # Store workspace in request state for easy access
+        request.state.workspace = workspace
+        return workspace
+    
+    return require_workspace
 
 
 def display_splash_screen(args: argparse.Namespace) -> None:
