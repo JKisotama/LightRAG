@@ -32,7 +32,6 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
-  const { isAdmin } = useAuthStore()
   const { t } = useTranslation()
 
   return (
@@ -47,11 +46,9 @@ function TabsNavigation() {
         <NavigationTab value="retrieval" currentTab={currentTab}>
           {t('header.retrieval')}
         </NavigationTab>
-        {isAdmin && (
-          <NavigationTab value="api" currentTab={currentTab}>
-            {t('header.api')}
-          </NavigationTab>
-        )}
+        <NavigationTab value="api" currentTab={currentTab}>
+          {t('header.api')}
+        </NavigationTab>
       </TabsList>
     </div>
   )
