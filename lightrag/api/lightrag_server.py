@@ -316,7 +316,14 @@ def create_app(args):
     )
 
     # Setup logging
-    logger.setLevel(args.log_level)
+    # DEBUG flag overrides log_level: debug=true → show all, debug=false → warnings only
+    if hasattr(args, 'debug') and args.debug:
+        effective_log_level = "DEBUG"
+    elif hasattr(args, 'debug') and not args.debug:
+        effective_log_level = "WARNING"
+    else:
+        effective_log_level = args.log_level
+    logger.setLevel(effective_log_level)
     set_verbose_debug(args.verbose)
 
     # Create configuration cache (this will output configuration logs)
@@ -1223,7 +1230,10 @@ def create_app(args):
             get_rag_for_workspace_func=get_rag_for_workspace,
         )
     )
-    app.include_router(create_query_routes(rag, api_key, args.top_k))
+    app.include_router(create_query_routes(
+        rag, api_key, args.top_k,
+        get_rag_for_workspace_func=get_rag_for_workspace
+    ))
     app.include_router(create_graph_routes(rag, api_key))
 
     # Add Ollama API routes

@@ -28,6 +28,7 @@ interface BackendState {
 interface AuthState {
   isAuthenticated: boolean;
   isGuestMode: boolean;  // Add guest mode flag
+  isAdmin: boolean;  // Add admin role flag
   coreVersion: string | null;
   apiVersion: string | null;
   username: string | null; // login username
@@ -180,12 +181,17 @@ const isGuestToken = (token: string): boolean => {
   return payload.role === 'guest';
 };
 
+const isAdminToken = (token: string): boolean => {
+  const payload = parseTokenPayload(token);
+  return payload.role === 'admin';
+};
+
 const getWorkspaceFromToken = (token: string): string | null => {
   const payload = parseTokenPayload(token);
   return payload.metadata?.workspace || null;
 };
 
-const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; workspace: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
+const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; isAdmin: boolean; coreVersion: string | null; apiVersion: string | null; username: string | null; workspace: string | null; webuiTitle: string | null; webuiDescription: string | null } => {
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
   const coreVersion = localStorage.getItem('LIGHTRAG-CORE-VERSION');
   const apiVersion = localStorage.getItem('LIGHTRAG-API-VERSION');
@@ -198,6 +204,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
     return {
       isAuthenticated: false,
       isGuestMode: false,
+      isAdmin: false,
       coreVersion: coreVersion,
       apiVersion: apiVersion,
       username: null,
@@ -210,6 +217,7 @@ const initAuthState = (): { isAuthenticated: boolean; isGuestMode: boolean; core
   return {
     isAuthenticated: true,
     isGuestMode: isGuestToken(token),
+    isAdmin: isAdminToken(token),
     coreVersion: coreVersion,
     apiVersion: apiVersion,
     username: username,
@@ -226,6 +234,7 @@ export const useAuthStore = create<AuthState>(set => {
   return {
     isAuthenticated: initialState.isAuthenticated,
     isGuestMode: initialState.isGuestMode,
+    isAdmin: initialState.isAdmin,
     coreVersion: initialState.coreVersion,
     apiVersion: initialState.apiVersion,
     username: initialState.username,
@@ -257,9 +266,11 @@ export const useAuthStore = create<AuthState>(set => {
 
       const username = getUsernameFromToken(token);
       const workspace = getWorkspaceFromToken(token);
+      const isAdmin = isAdminToken(token);
       set({
         isAuthenticated: true,
         isGuestMode: isGuest,
+        isAdmin: isAdmin,
         username: username,
         workspace: workspace,
         coreVersion: coreVersion,
@@ -280,6 +291,7 @@ export const useAuthStore = create<AuthState>(set => {
       set({
         isAuthenticated: false,
         isGuestMode: false,
+        isAdmin: false,
         username: null,
         workspace: null,
         coreVersion: coreVersion,

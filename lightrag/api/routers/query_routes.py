@@ -4,9 +4,10 @@ This module contains all query-related routes for the LightRAG API.
 
 import json
 from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from lightrag.base import QueryParam
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.rate_limiter import rate_limit_query
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator
 
@@ -190,13 +191,13 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60, get_rag_for_workspace_func=None):
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
         "/query",
         response_model=QueryResponse,
-        dependencies=[Depends(combined_auth)],
+        dependencies=[Depends(combined_auth), Depends(rate_limit_query)],
         responses={
             200: {
                 "description": "Successful RAG query response",
@@ -322,7 +323,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_request: Request):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -408,8 +409,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
 
+            # Workspace detection for multi-user isolation
+            target_rag = rag  # Default to global RAG
+            if get_rag_for_workspace_func and hasattr(http_request.state, 'user'):
+                user_info = http_request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    target_rag = await get_rag_for_workspace_func(workspace)
+                    logger.info(f"Using workspace RAG for query, user: {user_info.get('username')}")
+
             # Unified approach: always use aquery_llm for both cases
-            result = await rag.aquery_llm(request.query, param=param)
+            result = await target_rag.aquery_llm(request.query, param=param)
 
             # Extract LLM response and references from unified result
             llm_response = result.get("llm_response", {})
@@ -455,7 +465,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
     @router.post(
         "/query/stream",
-        dependencies=[Depends(combined_auth)],
+        dependencies=[Depends(combined_auth), Depends(rate_limit_query)],
         responses={
             200: {
                 "description": "Flexible RAG query response - format depends on stream parameter",
@@ -532,7 +542,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_request: Request):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -666,8 +676,17 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
             from fastapi.responses import StreamingResponse
 
+            # Workspace detection for multi-user isolation
+            target_rag = rag  # Default to global RAG
+            if get_rag_for_workspace_func and hasattr(http_request.state, 'user'):
+                user_info = http_request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    target_rag = await get_rag_for_workspace_func(workspace)
+                    logger.info(f"Using workspace RAG for streaming query, user: {user_info.get('username')}")
+
             # Unified approach: always use aquery_llm for all cases
-            result = await rag.aquery_llm(request.query, param=param)
+            result = await target_rag.aquery_llm(request.query, param=param)
 
             async def stream_generator():
                 # Extract references and LLM response from unified result

@@ -49,6 +49,8 @@ inputs/
 output/
 rag_storage/
 data/
+chroma/
+backups/
 
 # Evaluation results
 lightrag/evaluation/results/
@@ -74,3 +76,4 @@ download_models_hf.py
 memory-bank
 .claude/CLAUDE.md
 .claude/
+.env.production

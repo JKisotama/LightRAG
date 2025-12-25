@@ -12,28 +12,67 @@ services:
     volumes:
       - ./data/rag_storage:/app/data/rag_storage
       - ./data/inputs:/app/data/inputs
-      - ./config.ini:/app/config.ini
       - ./.env:/app/.env
     env_file:
       - .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URI: redis://redis:6379
+      DEBUG: "false"
+      ENABLE_RATE_LIMITING: "true"
+      LIGHTRAG_KV_STORAGE: PGKVStorage
+      LIGHTRAG_DOC_STATUS_STORAGE: PGDocStatusStorage
+      LIGHTRAG_GRAPH_STORAGE: PGGraphStorage
+      LIGHTRAG_VECTOR_STORAGE: PGVectorStorage
     restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:9621/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   postgres:
     image: pgvector/pgvector:pg16
     container_name: lightrag_postgres
     environment:
-      POSTGRES_USER: rag_user
-      POSTGRES_PASSWORD: rag_password
-      POSTGRES_DB: lightrag_db
+      POSTGRES_USER: ${POSTGRES_USER:-rag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rag_password}
+      POSTGRES_DB: ${POSTGRES_DATABASE:-lightrag_db}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rag_user} -d ${POSTGRES_DATABASE:-lightrag_db}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: lightrag_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
 volumes:
   postgres_data:
+  redis_data:

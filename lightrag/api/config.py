@@ -151,10 +151,16 @@ def parse_args() -> argparse.Namespace:
 
     # Logging configuration
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=get_env_value("DEBUG", False, bool),
+        help="Enable debug mode - shows all logs in terminal (default: false, only warnings/errors shown)",
+    )
+    parser.add_argument(
         "--log-level",
         default=get_env_value("LOG_LEVEL", "INFO"),
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging level (default: from env or INFO)",
+        help="Logging level (default: from env or INFO). Overridden by --debug flag.",
     )
     parser.add_argument(
         "--verbose",
@@ -402,8 +408,12 @@ def parse_args() -> argparse.Namespace:
 
     # For JWT Auth
     args.auth_accounts = get_env_value("AUTH_ACCOUNTS", "")
-    args.token_secret = get_env_value("TOKEN_SECRET", "lightrag-jwt-default-secret")
-    args.token_expire_hours = get_env_value("TOKEN_EXPIRE_HOURS", 48, int)
+    # Auto-generate random secret on each server start unless explicitly set in .env
+    # This forces all users to re-login after server restarts
+    import secrets
+    default_secret = secrets.token_hex(32)  # 64 character random hex string
+    args.token_secret = get_env_value("TOKEN_SECRET", default_secret)
+    args.token_expire_hours = get_env_value("TOKEN_EXPIRE_HOURS", 5, int)
     args.guest_token_expire_hours = get_env_value("GUEST_TOKEN_EXPIRE_HOURS", 24, int)
     args.jwt_algorithm = get_env_value("JWT_ALGORITHM", "HS256")
 

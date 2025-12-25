@@ -31,6 +31,7 @@ from lightrag.utils import (
     sanitize_text_for_encoding,
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
+from lightrag.api.rate_limiter import rate_limit_upload, rate_limit_scan
 from ..config import global_args
 
 
@@ -2043,7 +2044,7 @@ def create_document_routes(
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
-        "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
+        "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth), Depends(rate_limit_scan)]
     )
     async def scan_for_new_documents(background_tasks: BackgroundTasks):
         """
@@ -2068,7 +2069,7 @@ def create_document_routes(
         )
 
     @router.post(
-        "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
+        "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth), Depends(rate_limit_upload)]
     )
     async def upload_to_input_dir(
         background_tasks: BackgroundTasks, request: Request, file: UploadFile = File(...)
@@ -2522,7 +2523,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(http_request: Request) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -2553,15 +2554,25 @@ def create_document_routes(
                 get_all_update_flags_status,
             )
 
+            # Workspace detection for multi-user isolation
+            target_workspace = rag.workspace  # Default to global RAG workspace
+            if get_rag_for_workspace_func and hasattr(http_request.state, 'user'):
+                user_info = http_request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    workspace_rag = await get_rag_for_workspace_func(workspace)
+                    target_workspace = workspace_rag.workspace
+                    logger.info(f"Using workspace for pipeline status, user: {user_info.get('username')}")
+
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=target_workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=target_workspace
             )
 
             # Get update flags status for all namespaces
-            update_status = await get_all_update_flags_status(workspace=rag.workspace)
+            update_status = await get_all_update_flags_status(workspace=target_workspace)
 
             # Convert MutableBoolean objects to regular boolean values
             processed_update_status = {}
@@ -2621,7 +2632,7 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(http_request: Request) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -2640,6 +2651,15 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving document statuses (500).
         """
         try:
+            # Workspace detection for multi-user isolation
+            target_rag = rag  # Default to global RAG
+            if get_rag_for_workspace_func and hasattr(http_request.state, 'user'):
+                user_info = http_request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    target_rag = await get_rag_for_workspace_func(workspace)
+                    logger.info(f"Using workspace RAG for documents, user: {user_info.get('username')}")
+
             statuses = (
                 DocStatus.PENDING,
                 DocStatus.PROCESSING,
@@ -2648,7 +2668,7 @@ def create_document_routes(
                 DocStatus.FAILED,
             )
 
-            tasks = [rag.get_docs_by_status(status) for status in statuses]
+            tasks = [target_rag.get_docs_by_status(status) for status in statuses]
             results: List[Dict[str, DocProcessingStatus]] = await asyncio.gather(*tasks)
 
             response = DocsStatusesResponse()
@@ -2995,6 +3015,7 @@ def create_document_routes(
     )
     async def get_documents_paginated(
         request: DocumentsRequest,
+        http_request: Request,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -3016,15 +3037,24 @@ def create_document_routes(
             HTTPException: If an error occurs while retrieving documents (500).
         """
         try:
+            # Workspace detection for multi-user isolation
+            target_rag = rag  # Default to global RAG
+            if get_rag_for_workspace_func and hasattr(http_request.state, 'user'):
+                user_info = http_request.state.user
+                if user_info and user_info.get('metadata', {}).get('workspace'):
+                    workspace = user_info['metadata']['workspace']
+                    target_rag = await get_rag_for_workspace_func(workspace)
+                    logger.info(f"Using workspace RAG for documents list, user: {user_info.get('username')}")
+
             # Get paginated documents and status counts in parallel
-            docs_task = rag.doc_status.get_docs_paginated(
+            docs_task = target_rag.doc_status.get_docs_paginated(
                 status_filter=request.status_filter,
                 page=request.page,
                 page_size=request.page_size,
                 sort_field=request.sort_field,
                 sort_direction=request.sort_direction,
             )
-            status_counts_task = rag.doc_status.get_all_status_counts()
+            status_counts_task = target_rag.doc_status.get_all_status_counts()
 
             # Execute both queries in parallel
             (documents_with_ids, total_count), status_counts = await asyncio.gather(
