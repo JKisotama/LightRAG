@@ -2,11 +2,6 @@ services:
   lightrag:
     container_name: lightrag
     image: kisotama/lightrag-multi:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
-      tags:
-        - ghcr.io/hkuds/lightrag:latest
     ports:
       - "${PORT:-9621}:9621"
     volumes:
