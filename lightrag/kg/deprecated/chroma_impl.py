@@ -56,15 +56,27 @@ class ChromaVectorDBStorage(BaseVectorStorage):
             }
 
             local_path = config.get("local_path", None)
+            
+            # [FIX] Default to local path mode if no host is specified to avoid hanging
+            if not local_path and not config.get("host"):
+                working_dir = self.global_config.get("working_dir", "./rag_storage")
+                local_path = os.path.join(working_dir, "chroma")
+                logger.info(f"ChromaDB local_path not set, defaulting to: {local_path}")
+
             if local_path:
+                logger.info(f"Initializing ChromaDB PersistentClient at: {local_path}")
+                if not os.path.exists(local_path):
+                    os.makedirs(local_path, exist_ok=True)
+                    
                 self._client = PersistentClient(
                     path=local_path,
                     settings=Settings(
                         allow_reset=True,
                         anonymized_telemetry=False,
-                    ),
+                    )
                 )
             else:
+                logger.info(f"Initializing ChromaDB HttpClient at {config.get('host', 'localhost')}:{config.get('port', 4044)}")
                 auth_provider = config.get(
                     "auth_provider", "chromadb.auth.token_authn.TokenAuthClientProvider"
                 )
@@ -315,6 +327,21 @@ class ChromaVectorDBStorage(BaseVectorStorage):
         except Exception as e:
             logger.error(f"Error retrieving vector data for IDs {ids}: {e}")
             return []
+
+    async def get_vectors_by_ids(self, ids: list[str]) -> list[list[float]]:
+        """Get raw vectors by their IDs
+
+        Args:
+            ids: List of unique identifiers
+
+        Returns:
+            List of vectors (list of floats) corresponding to the IDs.
+            If an ID is not found, an empty list or None might be expected depending on base,
+            but typically this returns just the vectors found or raises error.
+            Based on usage, looks like we should return list of vectors.
+        """
+        data = await self.get_by_ids(ids)
+        return [item["vector"] for item in data if item is not None]
 
     async def drop(self) -> dict[str, str]:
         """Drop all vector data from storage and clean up resources
